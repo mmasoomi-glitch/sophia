@@ -12,7 +12,8 @@
 
 const fs = require('fs');
 const path = require('path');
-const { spawn } = require('child_process');
+
+const GATE_EXT = /\.(m?js|cjs)$/i;
 
 // ============================================================================
 // ARGUMENT PARSING
@@ -71,7 +72,8 @@ function loadChangedFiles(args, projectDir) {
   try {
     const base = args.base || process.env.MERGE_GATE_BASE || 'origin/main';
     const { execSync } = require('child_process');
-    const output = execSync(`git diff ${base}..HEAD --name-only`, {
+    // Three-dot diff = changes since merge-base; ACMR excludes deletions (a deleted file is not "unreachable").
+    const output = execSync(`git diff --diff-filter=ACMR --name-only ${base}...HEAD`, {
       cwd: projectDir,
       encoding: 'utf8'
     });
@@ -90,35 +92,42 @@ function loadChangedFiles(args, projectDir) {
 // CHECKER EXECUTION
 // ============================================================================
 
-function loadChecker(name, projectDir) {
-  try {
-    const checkerPath = path.join(projectDir, 'tools', 'merge-gate', `${name.toLowerCase()}-checker.js`);
-    const checkerModule = require(checkerPath);
+const CHECKER_FN = { D1: 'checkReachability', D2: 'checkConformance', D3: 'checkSelfMocking', D4: 'checkRealDependencyCoverage' };
 
-    if (name === 'D1') return checkerModule.checkReachability;
-    if (name === 'D2') return checkerModule.checkConformance;
-    if (name === 'D3') return checkerModule.checkSelfMocking;
-    if (name === 'D4') return checkerModule.checkRealDependencyCoverage;
+// A checker that cannot be loaded is a gate ERROR (exit 2), never a pass. PR #1 of this repo was merged
+// on a "PASS" produced while all four checkers reported "not found".
+function loadChecker(name, projectDir) {
+  // Checkers ship beside this orchestrator; a project-local copy under projectDir/tools/merge-gate wins if present.
+  const local = path.join(projectDir, 'tools', 'merge-gate', `${name.toLowerCase()}-checker.js`);
+  const bundled = path.join(__dirname, 'tools', 'merge-gate', `${name.toLowerCase()}-checker.js`);
+  const checkerPath = fs.existsSync(local) ? local : bundled;
+  try {
+    const checkerModule = require(checkerPath);
+    const fn = checkerModule[CHECKER_FN[name]];
+    if (typeof fn !== 'function') return { fn: null, error: `${checkerPath} does not export ${CHECKER_FN[name]}` };
+    return { fn, error: null };
   } catch (e) {
-    // Checker not found or error loading
+    return { fn: null, error: `${checkerPath}: ${e.message}` };
   }
-  return null;
 }
 
-async function runChecker(name, checkerFn, projectDir, changedFiles, timeoutMs = 30000) {
+async function runChecker(name, checker, projectDir, changedFiles, timeoutMs = 30000) {
   const startTime = Date.now();
 
   try {
-    if (!checkerFn) {
+    if (!checker || !checker.fn) {
       return {
         checker: name,
         name: getCheckerName(name),
-        status: 'SKIPPED',
+        status: 'ERROR',
         duration_ms: 0,
-        message: 'Checker not found',
-        severity: 'WARNING'
+        message: `Checker failed to load: ${checker ? checker.error : 'not provided'}`,
+        severity: 'ERROR',
+        exitCode: 2,
+        fullOutput: ''
       };
     }
+    const checkerFn = checker.fn;
 
     // Run checker with timeout
     const result = await Promise.race([
@@ -139,12 +148,20 @@ async function runChecker(name, checkerFn, projectDir, changedFiles, timeoutMs =
     const exitCode = result.exitCode || 0;
     const output = result.stdout || '';
 
-    // Determine status and severity
+    // Determine status and severity. Exit 2 from any checker is a gate error, not a verdict on the code.
     let status, severity;
-    if (name === 'D3' || name === 'D4') {
-      // D3 and D4 are always UNTESTED for now
-      status = 'UNTESTED';
-      severity = 'WARNING';
+    if (exitCode === 2) {
+      status = 'ERROR';
+      severity = 'ERROR';
+    } else if (name === 'D3' || name === 'D4') {
+      // Advisory checkers: findings warn, they never block.
+      if (exitCode === 0 && !/\[UNTESTED\]/.test(output)) {
+        status = 'PASS';
+        severity = 'OK';
+      } else {
+        status = 'UNTESTED';
+        severity = 'WARNING';
+      }
     } else {
       // D1 and D2 are hard blockers
       if (exitCode === 0) {
@@ -181,7 +198,7 @@ async function runChecker(name, checkerFn, projectDir, changedFiles, timeoutMs =
       status: 'ERROR',
       duration_ms: durationMs,
       message: `Error: ${e.message}`,
-      severity: 'DEFECT',
+      severity: 'ERROR',
       exitCode: 2,
       fullOutput: `error: ${e.message}\n`
     };
@@ -223,7 +240,7 @@ function parseCheckerOutput(name, output) {
     }
   }
 
-  return { error_lines: lines.slice(0, 5) };
+  return { error_lines: lines.slice(0, 50) };
 }
 
 // ============================================================================
@@ -234,27 +251,24 @@ function aggregateResults(checkResults, mode = 'pass-with-flag') {
   const blockers = ['D1', 'D2'];
   const nonBlockers = ['D3', 'D4'];
 
-  let hasDefect = false;
   let hasWarning = false;
+  let hasError = false;
   let blockersFailed = false;
 
   for (const result of checkResults) {
-    if (result.severity === 'DEFECT') {
-      if (blockers.includes(result.checker)) {
-        blockersFailed = true;
-      }
-      hasDefect = true;
-    }
-    if (result.severity === 'WARNING') {
-      hasWarning = true;
-    }
+    if (result.severity === 'DEFECT' && blockers.includes(result.checker)) blockersFailed = true;
+    if (result.severity === 'WARNING') hasWarning = true;
+    if (result.severity === 'ERROR') hasError = true;
   }
 
+  // Fail closed: a checker that errored or failed to load can never contribute to a PASS.
   let verdict, exitCode;
-
   if (blockersFailed) {
     verdict = 'FAIL';
     exitCode = 1;
+  } else if (hasError) {
+    verdict = 'ERROR';
+    exitCode = 2;
   } else if (mode === 'strict' && hasWarning) {
     verdict = 'WARN';
     exitCode = 2;
@@ -263,20 +277,15 @@ function aggregateResults(checkResults, mode = 'pass-with-flag') {
     exitCode = 0;
   }
 
-  // Count defects and warnings
   const defectCount = checkResults.filter(r => r.severity === 'DEFECT').length;
   const warningCount = checkResults.filter(r => r.severity === 'WARNING').length;
+  const errorCount = checkResults.filter(r => r.severity === 'ERROR').length;
 
-  let summary = '';
-  if (defectCount === 0 && warningCount === 0) {
-    summary = 'All checks passed';
-  } else if (defectCount > 0 && warningCount === 0) {
-    summary = `${defectCount} DEFECT${defectCount > 1 ? 's' : ''} found`;
-  } else if (defectCount === 0 && warningCount > 0) {
-    summary = `${warningCount} warning${warningCount > 1 ? 's' : ''} raised`;
-  } else {
-    summary = `${defectCount} DEFECT${defectCount > 1 ? 's' : ''} found; ${warningCount} warning${warningCount > 1 ? 's' : ''} raised`;
-  }
+  const parts = [];
+  if (defectCount) parts.push(`${defectCount} DEFECT${defectCount > 1 ? 's' : ''} found`);
+  if (errorCount) parts.push(`${errorCount} checker error${errorCount > 1 ? 's' : ''} (gate incomplete)`);
+  if (warningCount) parts.push(`${warningCount} warning${warningCount > 1 ? 's' : ''} raised`);
+  const summary = parts.length ? parts.join('; ') : 'All checks passed';
 
   return {
     verdict,
@@ -284,6 +293,7 @@ function aggregateResults(checkResults, mode = 'pass-with-flag') {
     exitCode,
     defectCount,
     warningCount,
+    errorCount,
     blockersFailed
   };
 }
@@ -292,16 +302,15 @@ function aggregateResults(checkResults, mode = 'pass-with-flag') {
 // OUTPUT GENERATION
 // ============================================================================
 
-function generateReport(checkResults, aggregation, changedFiles, projectDir, sha, base) {
-  const totalDuration = checkResults.reduce((sum, r) => sum + r.duration_ms, 0);
-
+function generateReport(checkResults, aggregation, changedFiles, projectDir, sha, base, skippedFiles = []) {
   const report = {
-    version: '2.0.0',
+    version: '2.1.0',
     timestamp: new Date().toISOString(),
     sha: sha || 'unknown',
     base_branch: base || 'main',
     files_changed: changedFiles,
     files_count: changedFiles.length,
+    files_skipped: skippedFiles,
 
     verdict: aggregation.verdict,
     summary: aggregation.summary,
@@ -333,6 +342,13 @@ function generateReport(checkResults, aggregation, changedFiles, projectDir, sha
           checker: r.checker,
           type: 'untested-checker',
           message: r.message
+        })),
+      errors: checkResults
+        .filter(r => r.severity === 'ERROR')
+        .map(r => ({
+          checker: r.checker,
+          type: 'checker-error',
+          message: r.message
         }))
     }
   };
@@ -340,26 +356,35 @@ function generateReport(checkResults, aggregation, changedFiles, projectDir, sha
   return report;
 }
 
+function severityIcon(severity) {
+  return severity === 'OK' ? '✓' : severity === 'WARNING' ? '?' : severity === 'ERROR' ? '!' : '✗';
+}
+
 function generateMarkdownComment(report) {
   const checks = report.checks
     .map(c => {
-      const icon = c.severity === 'OK' ? '✓' : c.severity === 'WARNING' ? '?' : '✗';
-      return `${icon} ${c.checker} (${c.name}): ${c.message}`;
+      let block = `${severityIcon(c.severity)} **${c.checker}** (${c.name}): ${c.message}`;
+      const lines = (c.details && c.details.error_lines) || [];
+      if (c.severity !== 'OK' && lines.length > 1) {
+        block += '\n' + lines.slice(0, 10).map(l => `    ${l}`).join('\n');
+      }
+      return block;
     })
     .join('\n');
 
-  const markdown = `## Merge Gate Report
+  const verdictLabel = { PASS: '✅ PASS', FAIL: '❌ FAIL', ERROR: '⚠️ ERROR (gate incomplete)', WARN: '⚠️ WARN' }[report.verdict] || report.verdict;
+  const skipped = report.files_skipped && report.files_skipped.length
+    ? `\n**Out of scope (non-JS):** ${report.files_skipped.length} file(s)` : '';
 
-**Verdict:** ${report.verdict_final.pass ? '✅ PASS' : '❌ FAIL'}
+  return `## Merge Gate Report
+
+**Verdict:** ${verdictLabel} — ${report.summary}
 
 ${checks}
 
-**Files:** ${report.files_changed.join(', ') || '(none)'}
-**Time:** ${report.checks.reduce((s, c) => s + c.duration_ms, 0)}ms
+**Gated files:** ${report.files_changed.join(', ') || '(none)'}${skipped}
 **Base:** ${report.base_branch}
 `;
-
-  return markdown;
 }
 
 function printConsoleReport(report) {
@@ -372,11 +397,15 @@ function printConsoleReport(report) {
   console.log('');
 
   for (const check of report.checks) {
-    const icon = check.severity === 'OK' ? '✓' : check.severity === 'WARNING' ? '?' : '✗';
-    console.log(`${icon} ${check.checker} (${check.name}): ${check.message} (${check.duration_ms}ms)`);
+    console.log(`${severityIcon(check.severity)} ${check.checker} (${check.name}): ${check.message} (${check.duration_ms}ms)`);
 
     if (check.details && check.details.missing_methods) {
       console.log(`  Missing methods: ${check.details.missing_methods.join(', ')}`);
+    }
+    const lines = (check.details && check.details.error_lines) || [];
+    if (check.severity !== 'OK' && lines.length > 1) {
+      for (const l of lines.slice(1, 10)) console.log(`  ${l}`);
+      if (lines.length > 10) console.log(`  … ${lines.length - 10} more`);
     }
   }
 
@@ -401,39 +430,37 @@ async function orchestrate() {
       process.exit(1);
     }
 
-    // Load changed files
-    const changedFiles = loadChangedFiles(args, projectDir);
+    // Only JS modules are in scope for an import-graph gate; everything else is reported, not judged.
+    const allChanged = loadChangedFiles(args, projectDir);
+    const changedFiles = allChanged.filter(f => GATE_EXT.test(f));
+    const skippedFiles = allChanged.filter(f => !GATE_EXT.test(f));
 
-    if (changedFiles.length === 0) {
+    if (allChanged.length === 0) {
       console.warn('Warning: no changed files detected');
+    } else if (skippedFiles.length) {
+      console.log(`Out of gate scope (non-JS): ${skippedFiles.length} file(s): ${skippedFiles.slice(0, 10).join(', ')}${skippedFiles.length > 10 ? ', …' : ''}`);
     }
 
-    // Load checkers
-    const d1Fn = loadChecker('D1', projectDir);
-    const d2Fn = loadChecker('D2', projectDir);
-    const d3Fn = loadChecker('D3', projectDir);
-    const d4Fn = loadChecker('D4', projectDir);
+    const checkers = ['D1', 'D2', 'D3', 'D4'].map(n => loadChecker(n, projectDir));
 
-    // Run all checkers in parallel
     const results = await Promise.all([
-      runChecker('D1', d1Fn, projectDir, changedFiles, 30000),
-      runChecker('D2', d2Fn, projectDir, changedFiles, 45000),
-      runChecker('D3', d3Fn, projectDir, changedFiles, 30000),
-      runChecker('D4', d4Fn, projectDir, changedFiles, 30000)
+      runChecker('D1', checkers[0], projectDir, changedFiles, 30000),
+      runChecker('D2', checkers[1], projectDir, changedFiles, 45000),
+      runChecker('D3', checkers[2], projectDir, changedFiles, 30000),
+      runChecker('D4', checkers[3], projectDir, changedFiles, 30000)
     ]);
 
-    // Aggregate results
     const mode = args.mode || 'pass-with-flag';
     const aggregation = aggregateResults(results, mode);
 
-    // Generate report
     const report = generateReport(
       results,
       aggregation,
       changedFiles,
       projectDir,
       args.sha || process.env.MERGE_GATE_SHA,
-      args.base || process.env.MERGE_GATE_BASE
+      args.base || process.env.MERGE_GATE_BASE,
+      skippedFiles
     );
 
     // Write JSON output
@@ -475,25 +502,20 @@ async function gate(options = {}) {
   const { files, sha, base, projectDir = process.cwd(), mode = 'pass-with-flag' } = options;
 
   try {
-    // Load checkers
-    const d1Fn = loadChecker('D1', projectDir);
-    const d2Fn = loadChecker('D2', projectDir);
-    const d3Fn = loadChecker('D3', projectDir);
-    const d4Fn = loadChecker('D4', projectDir);
+    const allFiles = files || [];
+    const gated = allFiles.filter(f => GATE_EXT.test(f));
+    const skipped = allFiles.filter(f => !GATE_EXT.test(f));
+    const checkers = ['D1', 'D2', 'D3', 'D4'].map(n => loadChecker(n, projectDir));
 
-    // Run all checkers in parallel
     const results = await Promise.all([
-      runChecker('D1', d1Fn, projectDir, files, 30000),
-      runChecker('D2', d2Fn, projectDir, files, 45000),
-      runChecker('D3', d3Fn, projectDir, files, 30000),
-      runChecker('D4', d4Fn, projectDir, files, 30000)
+      runChecker('D1', checkers[0], projectDir, gated, 30000),
+      runChecker('D2', checkers[1], projectDir, gated, 45000),
+      runChecker('D3', checkers[2], projectDir, gated, 30000),
+      runChecker('D4', checkers[3], projectDir, gated, 30000)
     ]);
 
-    // Aggregate results
     const aggregation = aggregateResults(results, mode);
-
-    // Generate report
-    const report = generateReport(results, aggregation, files || [], projectDir, sha, base);
+    const report = generateReport(results, aggregation, gated, projectDir, sha, base, skipped);
 
     return {
       pass: aggregation.exitCode === 0,

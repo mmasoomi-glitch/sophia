@@ -1,6 +1,8 @@
 // D2 Interface Conformance Checker - Supports both CommonJS and ESM
 const fs = require('fs');
 const path = require('path');
+const lib = require('./gate-lib.js');
+const { stripComments } = lib;
 
 function normalizePath(p) {
   return p.split(path.sep).join('/');
@@ -109,19 +111,28 @@ function extractExports(content, filePath, projectDir, visited = new Set()) {
   if (visited.has(filePath)) return exports;
   visited.add(filePath);
 
+  let match;
+  // CommonJS: exports.foo = … / module.exports.foo = …
+  const cjsNamed = /(?:module\.)?exports\.([A-Za-z_$][\w$]*)\s*=/g;
+  while ((match = cjsNamed.exec(content)) !== null) exports[match[1]] = true;
+
   // CommonJS: module.exports = { foo: ..., bar: ... }
-  const cjsPattern = /module\.exports\s*=\s*{([^}]+)}/;
-  let match = cjsPattern.exec(content);
-  if (match) {
-    const props = match[1].split(',');
-    for (const prop of props) {
-      const name = prop.trim().split(':')[0].split('(')[0].trim();
-      if (name && name !== '') {
-        exports[name] = true;
-      }
+  const cjsObj = /module\.exports\s*=\s*{([^}]*)}/.exec(content);
+  if (cjsObj) {
+    for (const prop of cjsObj[1].split(',')) {
+      const name = prop.trim().split(':')[0].split('(')[0].replace(/^(?:async\s+|\.\.\.)/, '').trim();
+      if (name) exports[name] = true;
     }
     return exports;
   }
+  // CommonJS: module.exports = new Foo() / class Foo {} / anything else (opaque)
+  const cjsOther = /module\.exports\s*=\s*(?:new\s+([A-Za-z_$][\w$]*)|class\s+([A-Za-z_$][\w$]*)|(\S))/.exec(content);
+  if (cjsOther) {
+    if (cjsOther[1] || cjsOther[2]) { Object.assign(exports, extractClassMethods(content, cjsOther[1] || cjsOther[2])); return exports; }
+    exports.__opaque__ = true;
+    return exports;
+  }
+  if (/Object\.assign\s*\(\s*(?:module\.)?exports\b/.test(content)) exports.__opaque__ = true;
 
   // ESM: export function foo() {}
   const exportFunctionPattern = /export\s+(?:async\s+)?function\s+(\w+)\s*\(/g;
@@ -159,7 +170,7 @@ function extractExports(content, filePath, projectDir, visited = new Set()) {
 
     if (fs.existsSync(sourcePath)) {
       try {
-        const sourceContent = fs.readFileSync(sourcePath, 'utf8');
+        const sourceContent = stripComments(fs.readFileSync(sourcePath, 'utf8'));
         const sourceExports = extractExports(sourceContent, resolved, projectDir, visited);
 
         for (const name of names) {
@@ -184,7 +195,7 @@ function extractExports(content, filePath, projectDir, visited = new Set()) {
 
     if (fs.existsSync(sourcePath)) {
       try {
-        const sourceContent = fs.readFileSync(sourcePath, 'utf8');
+        const sourceContent = stripComments(fs.readFileSync(sourcePath, 'utf8'));
         const sourceExports = extractExports(sourceContent, resolved, projectDir, visited);
         Object.assign(exports, sourceExports);
       } catch (e) {
@@ -223,6 +234,9 @@ function extractExports(content, filePath, projectDir, visited = new Set()) {
     const classMethods = extractClassMethods(content, className);
     Object.assign(exports, classMethods);
   }
+
+  // ESM: export default <identifier | function | expression> — shape unknown; do not judge member calls on it.
+  if (/export\s+default\s+(?!\{|new\s|class\b)/.test(content)) exports.__opaque__ = true;
 
   return exports;
 }
@@ -271,44 +285,43 @@ function checkConformance(projectDir, changedFiles = null) {
     }
     
     const errors = [];
-    
+    const seen = new Set();
+
     for (const file of changedFiles) {
       const filePath = path.join(projectDir, file.split('/').join(path.sep));
       if (!fs.existsSync(filePath)) continue;
-      
+
       try {
-        const content = fs.readFileSync(filePath, 'utf8');
-        
-        // Extract both require and import maps
-        const requireMap = extractRequireMap(content, file);
-        const importMap = extractImportMap(content, file);
-        const allImports = { ...requireMap, ...importMap };
-        
-        // Extract method calls
-        const methodCalls = extractMethodCalls(content);
-        
-        // Check each method call
+        const content = stripComments(fs.readFileSync(filePath, 'utf8'));
+
+        // Only whole-module bindings (default import, `import * as`, `const x = require()`) have a shape D2 can
+        // know. A named import is a value (function, array, constant) whose members are not this module's exports.
+        const bindings = new Map();
+        for (const b of lib.extractImports(content, file, projectDir)) {
+          if (b.name && b.resolved && (b.kind === 'default' || b.kind === 'namespace' || b.kind === 'cjs')) bindings.set(b.name, b);
+        }
+        if (!bindings.size) continue;
+
+        const methodCalls = extractMethodCalls(lib.blankStrings(content));
+
         for (const call of methodCalls) {
-          if (!(call.variable in allImports)) continue; // Skip if variable not imported
-
-          const importPath = allImports[call.variable];
-          const currentDir = file.substring(0, file.lastIndexOf('/'));
-          const resolved = resolveModulePath(importPath, currentDir || '.', projectDir);
-
-          const modulePath = path.join(projectDir, resolved.split('/').join(path.sep));
+          const b = bindings.get(call.variable);
+          if (!b) continue;
+          const modulePath = path.join(projectDir, b.resolved.split('/').join(path.sep));
           if (!fs.existsSync(modulePath)) continue;
-          
-          const moduleContent = fs.readFileSync(modulePath, 'utf8');
-          const exports = extractExports(moduleContent, resolved, projectDir);
+
+          const moduleContent = stripComments(fs.readFileSync(modulePath, 'utf8'));
+          const exports = extractExports(moduleContent, b.resolved, projectDir);
+          // An export whose shape cannot be read statically (export default someIdentifier, module.exports = fn)
+          // is not evidence of a phantom method.
+          if (exports.__opaque__ && b.kind !== 'namespace') continue;
+          if (b.kind === 'namespace' && call.method === 'default') continue;
 
           if (!(call.method in exports)) {
-            errors.push({
-              file: file,
-              variable: call.variable,
-              method: call.method,
-              module: importPath,
-              lineContent: content.split('\n').find(line => line.includes(call.variable + '.' + call.method))
-            });
+            const key = `${file}|${call.variable}.${call.method}`;
+            if (seen.has(key)) continue;
+            seen.add(key);
+            errors.push({ file, variable: call.variable, method: call.method, module: b.spec });
           }
         }
       } catch (e) {
@@ -329,4 +342,4 @@ function checkConformance(projectDir, changedFiles = null) {
   }
 }
 
-module.exports = { checkConformance };
+module.exports = { checkConformance, extractExports };

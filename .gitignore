@@ -1,0 +1,21 @@
+# Secrets, env, pod bootstrap material — this repo is PUBLIC
+.env*
+*.env
+*.env.*
+_boot.env.txt
+_pub.txt
+pushkey.py
+*.b64
+*.bak-*
+*.pem
+*.key
+
+# Runtime noise
+__pycache__/
+*.pyc
+*.log
+*.err
+*.tgz
+Claude outputs/
+node_modules/
+merge-gate-report.*

@@ -1,0 +1,10 @@
+{
+  "entrypoints": [
+    "merge-gate.js",
+    "tools/merge-gate/d1-checker.js",
+    "tools/merge-gate/d2-checker.js",
+    "tools/merge-gate/d3-checker.js",
+    "tools/merge-gate/d4-checker.js"
+  ],
+  "_note": "This repository's product code is Python; the only JS here is the gate itself. merge-gate.js loads the checkers by a computed path, which D1 cannot follow, so they are listed as roots explicitly."
+}

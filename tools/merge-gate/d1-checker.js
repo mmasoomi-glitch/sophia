@@ -1,161 +1,71 @@
-// D1 Reachability Checker - Supports both CommonJS and ESM
+// D1 Reachability — blocking. Every changed application module (.js/.mjs/.cjs, excluding test and setup files)
+// must be reachable from the configured entrypoints through static imports, require(), dynamic import('...')
+// with a literal specifier, or re-exports (export * from / export { x } from).
+//
+// Entrypoints: merge-gate.config.json {"entrypoints": [...]}, else package.json "entrypoints", else "main".
+// Exit 2 (gate error, not a code defect) when none are configured.
+//
+// CANNOT follow: computed specifiers (require(path.join(...)), import(`./${name}`)), require.resolve, bare
+// package names, anything loaded by a non-JS file (HTML, config), or workers/plugins started by string path.
+// List such modules as extra entrypoints.
 const fs = require('fs');
 const path = require('path');
+const lib = require('./gate-lib.js');
 
-function normalizePath(p) {
-  return p.split(path.sep).join('/');
-}
-
-function extractImportsFromFile(content, filePath) {
-  const imports = [];
-
-  // CommonJS: require()
-  const requirePattern = /require\s*\(\s*['"`]([^'"` ]+)['"`]\s*\)/g;
-  let match;
-  while ((match = requirePattern.exec(content)) !== null) {
-    if (match[1].startsWith('.')) imports.push(match[1]);
+function loadEntrypoints(projectDir) {
+  const cfgPath = path.join(projectDir, 'merge-gate.config.json');
+  if (fs.existsSync(cfgPath)) {
+    const cfg = JSON.parse(fs.readFileSync(cfgPath, 'utf8'));
+    if (Array.isArray(cfg.entrypoints) && cfg.entrypoints.length) return { entrypoints: cfg.entrypoints, source: 'merge-gate.config.json' };
   }
-
-  // ESM: import ... from '...'
-  const importPattern = /import\s+(?:(?:{[^}]*}|\*\s+as\s+\w+|\w+)(?:\s*,)?\s*)*(?:from\s+)?['"`]([^'"` ]+)['"`]/g;
-  while ((match = importPattern.exec(content)) !== null) {
-    if (match[1].startsWith('.')) imports.push(match[1]);
-  }
-
-  // Dynamic imports: import(path) - handles await import("./db.mjs") syntax
-  const dynamicImportPattern = /import\s*\(\s*['"`]([^'"` ]+)['"`]\s*\)/g;
-  while ((match = dynamicImportPattern.exec(content)) !== null) {
-    if (match[1].startsWith('.')) imports.push(match[1]);
-  }
-
-  return imports;
-}
-
-function resolveModulePath(importPath, currentDir) {
-  let resolved = path.normalize(
-    path.join(currentDir, importPath).split(path.sep).join('/')
-  ).split(path.sep).join('/');
-
-  // Add extension if needed
-  if (!resolved.endsWith('.js') && !resolved.endsWith('.mjs') && !resolved.endsWith('.json')) {
-    const resolvedPath = resolved.split('/').join(path.sep);
-
-    // Try .mjs extension
-    if (fs.existsSync(resolvedPath + '.mjs')) {
-      return resolved + '.mjs';
-    }
-
-    // Try .js extension
-    if (fs.existsSync(resolvedPath + '.js')) {
-      return resolved + '.js';
-    }
-
-    // Check if it's a directory with index file
-    if (fs.existsSync(resolvedPath) && fs.lstatSync(resolvedPath).isDirectory()) {
-      // Try index.mjs
-      const indexMjsPath = path.join(resolvedPath, 'index.mjs');
-      if (fs.existsSync(indexMjsPath)) {
-        return resolved + '/index.mjs';
-      }
-
-      // Try index.js
-      const indexJsPath = path.join(resolvedPath, 'index.js');
-      if (fs.existsSync(indexJsPath)) {
-        return resolved + '/index.js';
-      }
-    }
-  }
-
-  return resolved;
-}
-
-function checkReachability(projectDir, changedFiles = null) {
-  try {
-    const pkgPath = path.join(projectDir, 'package.json');
-    if (!fs.existsSync(pkgPath)) {
-      return { exitCode: 1, stdout: 'package.json not found\n' };
-    }
-    
+  const pkgPath = path.join(projectDir, 'package.json');
+  if (fs.existsSync(pkgPath)) {
     const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8'));
-    const entrypoints = Array.isArray(pkg.entrypoints) 
-      ? pkg.entrypoints 
-      : (pkg.main ? [pkg.main] : []);
-    
+    if (Array.isArray(pkg.entrypoints) && pkg.entrypoints.length) return { entrypoints: pkg.entrypoints, source: 'package.json entrypoints' };
+    if (pkg.main) return { entrypoints: [pkg.main], source: 'package.json main' };
+  }
+  return { entrypoints: [], source: null };
+}
+
+function checkReachability(projectDir, changedFiles = null, opts = {}) {
+  try {
+    const { entrypoints, source } = Array.isArray(opts.entrypoints) && opts.entrypoints.length
+      ? { entrypoints: opts.entrypoints, source: 'argument' }
+      : loadEntrypoints(projectDir);
     if (entrypoints.length === 0) {
-      return { exitCode: 1, stdout: 'No entrypoints found in package.json\n' };
+      return { exitCode: 2, stdout: 'no entrypoints configured (merge-gate.config.json "entrypoints", or package.json "entrypoints"/"main")\n' };
     }
-    
-    // If no changed files, find all .js/.mjs files
-    if (!changedFiles) {
-      changedFiles = [];
-      const walk = (dir) => {
-        const files = fs.readdirSync(dir);
-        for (const file of files) {
-          if (file === 'node_modules' || file.startsWith('.')) continue;
-          const fullPath = path.join(dir, file);
-          const rel = normalizePath(path.relative(projectDir, fullPath));
-          if (fs.lstatSync(fullPath).isDirectory()) {
-            walk(fullPath);
-          } else if (file.endsWith('.js') || file.endsWith('.mjs')) {
-            changedFiles.push(rel);
-          }
-        }
-      };
-      walk(projectDir);
-    } else {
-      changedFiles = changedFiles.map(normalizePath);
+    const roots = entrypoints.map(lib.normalizeRel);
+
+    const all = changedFiles ? changedFiles.map(lib.normalizeRel) : lib.walkFiles(projectDir, lib.isGateFile);
+    const files = all.filter(f => lib.isGateFile(f) && !lib.isTestFile(f) && !lib.isSetupFile(f));
+    const tests = all.filter(f => lib.isGateFile(f) && (lib.isTestFile(f) || lib.isSetupFile(f)));
+    if (files.length === 0) {
+      return { exitCode: 0, stdout: `no gate-relevant application modules among ${all.length} changed file(s)${tests.length ? ` (${tests.length} test/setup file(s) are out of D1 scope)` : ''}\n` };
     }
-    
-    // Build reachability graph
-    const reachable = new Set();
-    const queue = [];
-    
-    for (const ep of entrypoints) {
-      queue.push(ep);
-      reachable.add(normalizePath(ep));
-    }
-    
-    // BFS to find all reachable files
+
+    const reachable = new Set(roots);
+    const queue = [...roots];
     while (queue.length > 0) {
       const current = queue.shift();
-      const currentPath = path.join(projectDir, current.split('/').join(path.sep));
-      
-      if (!fs.existsSync(currentPath)) continue;
-      
-      try {
-        const content = fs.readFileSync(currentPath, 'utf8');
-        const imports = extractImportsFromFile(content, current);
-        
-        for (const imp of imports) {
-          const currentDir = current.substring(0, current.lastIndexOf('/'));
-          const resolved = resolveModulePath(imp, currentDir || '.');
-          
-          if (!reachable.has(resolved)) {
-            reachable.add(resolved);
-            queue.push(resolved);
-          }
-        }
-      } catch (e) {
-        // Ignore parse errors
+      let content;
+      try { content = lib.readRel(projectDir, current); } catch { continue; }
+      for (const b of lib.extractImports(content, current, projectDir)) {
+        if (!b.resolved || reachable.has(b.resolved)) continue;
+        reachable.add(b.resolved);
+        queue.push(b.resolved);
       }
     }
-    
-    // Check if all changed files are reachable
-    const unreachable = [];
-    for (const file of changedFiles) {
-      if (!reachable.has(file)) {
-        unreachable.push(file);
-      }
-    }
-    
+
+    const unreachable = files.filter(f => !reachable.has(f));
+    const rootsLabel = `[${roots.join(', ')}] (${source})`;
     if (unreachable.length > 0) {
-      return { exitCode: 1, stdout: unreachable.map(f => `${f}: unreachable from entrypoints`).join('\n') + '\n' };
+      return { exitCode: 1, stdout: unreachable.map(f => `${f}: unreachable from entrypoints ${rootsLabel}`).join('\n') + '\n' };
     }
-    
-    return { exitCode: 0, stdout: 'all files reachable\n' };
+    return { exitCode: 0, stdout: `all ${files.length} changed module(s) reachable from ${rootsLabel}${tests.length ? `; ${tests.length} test/setup file(s) out of D1 scope` : ''}\n` };
   } catch (e) {
-    return { exitCode: 1, stdout: `error: ${e.message}\n` };
+    return { exitCode: 2, stdout: `error: ${e.message}\n` };
   }
 }
 
-module.exports = { checkReachability };
+module.exports = { checkReachability, loadEntrypoints };

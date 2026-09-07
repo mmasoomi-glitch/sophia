@@ -4,35 +4,46 @@ on:
   pull_request:
     types: [opened, synchronize, reopened]
   push:
-    branches: [main, develop]
+    branches: [main]
+
+permissions:
+  contents: read
+  pull-requests: write
 
 jobs:
   merge-gate:
     runs-on: ubuntu-latest
-    
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v3
+      - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      
-      - name: Setup Node.js
-        uses: actions/setup-node@v3
+
+      - uses: actions/setup-node@v4
         with:
-          node-version: '18'
-      
-      - name: Install dependencies
-        run: npm install
-      
-      - name: Run Merge Gate Checkers
-        run: node merge-gate.js
+          node-version: '20'
+
+      - name: "Gate self-test (independent corpora, issue-866 replay, fail-closed check)"
+        run: node tools/merge-gate/selftest.js
+
+      - name: Run merge gate
         env:
-          CI: true
-      
-      - name: Comment PR with results
-        if: github.event_name == 'pull_request'
-        uses: actions/github-script@v6
+          MERGE_GATE_BASE: ${{ github.event_name == 'pull_request' && format('origin/{0}', github.base_ref) || github.event.before }}
+          MERGE_GATE_SHA: ${{ github.sha }}
+        run: |
+          if ! git cat-file -e "$MERGE_GATE_BASE" 2>/dev/null; then MERGE_GATE_BASE=HEAD~1; fi
+          node merge-gate.js --base "$MERGE_GATE_BASE" --sha "$MERGE_GATE_SHA" \
+            --output-json merge-gate-report.json --output-markdown merge-gate-report.md
+
+      - name: Comment on PR
+        if: always() && github.event_name == 'pull_request'
+        uses: actions/github-script@v7
         with:
           script: |
-            // Script to post merge gate results to PR
-            console.log('Merge gate checks completed successfully');
+            const fs = require('fs');
+            if (!fs.existsSync('merge-gate-report.md')) return;
+            const marker = '<!-- merge-gate-report -->';
+            const body = marker + '\n' + fs.readFileSync('merge-gate-report.md', 'utf8');
+            const { data: comments } = await github.rest.issues.listComments({ ...context.repo, issue_number: context.issue.number });
+            const prev = comments.find(c => c.body && c.body.startsWith(marker));
+            if (prev) await github.rest.issues.updateComment({ ...context.repo, comment_id: prev.id, body });
+            else await github.rest.issues.createComment({ ...context.repo, issue_number: context.issue.number, body });

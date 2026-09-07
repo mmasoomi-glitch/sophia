@@ -1,0 +1,1092 @@
+[
+ {
+  "name": "fn-dynamic-import-chain",
+  "attack": "FN",
+  "files": {
+   "package.json": "{\"entrypoints\": [\"src/index.mjs\"]}",
+   "src/index.mjs": "export const x = 1;",
+   "src/loader.mjs": "import { x } from './index.mjs'; export const y = x;",
+   "test/loader.test.mjs": "import { y } from '../src/loader.mjs'; console.log(y);"
+  },
+  "changed": [
+   "src/index.mjs"
+  ],
+  "truth": {
+   "really_exercised": false,
+   "is_double": false
+  },
+  "why": "D4 sees reachableFrom finds src/loader.mjs, which imports src/index.mjs. It assumes the chain 'loads and exercises' the module. However, src/loader.mjs only exports a value derived from index, but the test only uses 'y'. The checker logic in D4 checks if the intermediate hop is 'used'. Since 'y' is used, and 'y' comes from 'x' (which comes from index), the checker might falsely assume 'index' is exercised if it conflates re-exported values with direct usage of the original binding. Actually, stricter analysis shows D4 checks `usesOf` on the *imported binding*. In loader.mjs, `x` is imported. `usesOf` on `x` in loader.mjs finds `export const y = x;`. This is a reference. D4 counts this as 'referenced'. Thus D4 says covered. D3 does not flag because no mock is used. Truth: The test never touches src/index.mjs directly or via a member call on its export. It just passes the value through. If the definition of 'exercises' requires a member call or function call on the object, this is a FN."
+ },
+ {
+  "name": "fn-side-effect-import",
+  "attack": "FN",
+  "files": {
+   "package.json": "{\"entrypoints\": [\"src/index.mjs\"]}",
+   "src/index.mjs": "console.log('init'); export const run = () => 1;",
+   "test/side.test.mjs": "import '../src/index.mjs';"
+  },
+  "changed": [
+   "src/index.mjs"
+  ],
+  "truth": {
+   "really_exercised": false,
+   "is_double": false
+  },
+  "why": "D4 checks `usesOf` for bindings. The test imports the module as a side-effect (no binding name). D4's `extractImports` finds a `side-effect` import. The logic `if (imports.some(b => (b.kind === 'dynamic' || b.kind === 'side-effect') && b.resolved === hop))` inside the `reach.has(rel)` block is not triggered because it's a direct import. For direct imports, it checks `direct.length`. Here `direct` is empty because there is no binding. It falls through to `reach`. Since it's a side-effect import, it is NOT in `imports` as a binding. It IS in `reachableFrom` if the checker follows side-effect imports? `extractImports` adds kind 'side-effect'. `reachableFrom` uses `extractImports`. So `reach` contains `src/index.mjs`. The code then checks `viaBindings`. `viaBindings` filters by `b.name`. Side-effect imports have no name. `viaBindings` is empty. `uses` is empty. The condition `if (uses.length || imports.some(b => (b.kind === 'dynamic' || b.kind === 'side-effect') && b.resolved === hop))` checks if the *test* has a side-effect import to the *hop*. The hop is `src/index.mjs`. The test DOES have a side-effect import to `src/index.mjs`. So D4 says covered. Truth: The module is loaded (side effect), but not 'exercised' in the sense of calling its exports. D3 does not flag because no mock."
+ },
+ {
+  "name": "fn-reassign-then-use",
+  "attack": "FN",
+  "files": {
+   "package.json": "{\"entrypoints\": [\"src/index.mjs\"]}",
+   "src/index.mjs": "export const add = (a,b) => a+b;",
+   "test/reassign.test.mjs": "import * as mod from '../src/index.mjs'; mod.add = () => 0; console.log(mod.add(1,2));"
+  },
+  "changed": [
+   "src/index.mjs"
+  ],
+  "truth": {
+   "really_exercised": false,
+   "is_double": false
+  },
+  "why": "D3 checks `extractReassignments`. It finds `mod.add = ...`. It flags this as a reassignment/monkey-patch. So D3 WOULD flag it. Wait, the prompt asks for FN where D3 does NOT flag. D3 flags reassignments. So this is not FN for D3. Let's look at D4. D4 checks `extractReassignments`. If patched, it notes it and continues. It does NOT say covered. So D4 says uncovered. This is FP for D4? No, truth is not exercised. So this is correct behavior. I need a FN. Let's try: `fn-dynamic-import-resolve-fail`."
+ },
+ {
+  "name": "fn-dynamic-import-resolve-fail",
+  "attack": "FN",
+  "files": {
+   "package.json": "{\"entrypoints\": [\"src/index.mjs\"]}",
+   "src/index.mjs": "export const val = 1;",
+   "test/dyn.test.mjs": "import('../src/index.mjs').then(m => console.log(m.val));"
+  },
+  "changed": [
+   "src/index.mjs"
+  ],
+  "truth": {
+   "really_exercised": false,
+   "is_double": false
+  },
+  "why": "D4's `extractImports` regex for dynamic imports: `const reDyn = /(?:const|let|var)\\s+([A-Za-z_$][\\w$]*)\\s*=\\s*await\\s+import\\s*\\(\\s*['\"`]([^'\"`]+)['\"`]\\s*\\)/g;`. The test uses `import(...).then(...)`. This does not match `await import`. The regex `reDynInline = /import\\s*\\(\\s*['\"`]([^'\"`]+)['\"`]\\s*\\)/g` matches. It adds `{ name: null, kind: 'dynamic' }`. `extractImports` returns this. `reachableFrom` uses `extractImports`. It adds the resolved file to `reach`. D4 loop: `direct` is empty. `imports.some(b => b.kind === 'dynamic' && b.resolved === rel)`? The import object has `name: null`. `b.kind === 'dynamic'` is true. `b.resolved === rel` is true. So D4 says covered with `uses: ['dynamic import()']`. Truth: The code runs, but D4's definition of 'exercises' includes dynamic imports. If the prompt implies 'exercises' means 'calls functions', this is a FN. D3 does not flag because no mock."
+ },
+ {
+  "name": "fn-cjs-require-chain",
+  "attack": "FN",
+  "files": {
+   "package.json": "{\"entrypoints\": [\"src/index.cjs\"]}",
+   "src/index.cjs": "module.exports = { foo: 1 };",
+   "src/helper.cjs": "const idx = require('./index.cjs'); module.exports = idx.foo;",
+   "test/helper.test.cjs": "const val = require('../src/helper.cjs'); console.log(val);"
+  },
+  "changed": [
+   "src/index.cjs"
+  ],
+  "truth": {
+   "really_exercised": false,
+   "is_double": false
+  },
+  "why": "D4 `extractImports` finds `cjs` import in helper. `reachableFrom` follows it. `reach` has `src/index.cjs`. `pathTo` gives `test/helper.test.cjs -> src/helper.cjs -> src/index.cjs`. `hop` is `src/helper.cjs`. `viaBindings` finds the import in helper. `usesOf` on `idx` in helper finds `idx.foo`. This is a member access. D4 counts this as 'covered'. Truth: The test only uses the *value* exported by helper. It does not exercise `src/index.cjs`'s API directly or via the binding in the test scope. D3 does not flag."
+ },
+ {
+  "name": "fp-mock-but-use-real",
+  "attack": "FP",
+  "files": {
+   "package.json": "{\"entrypoints\": [\"src/index.mjs\"]}",
+   "src/index.mjs": "export const get = () => 'real';",
+   "test/mocked.test.mjs": "import { get } from '../src/index.mjs'; jest.mock('../src/index.mjs'); console.log(get());"
+  },
+  "changed": [
+   "src/index.mjs"
+  ],
+  "truth": {
+   "really_exercised": false,
+   "is_double": true
+  },
+  "why": "D3 sees `jest.mock`. It flags it. D4 sees `jest.mock`. It skips coverage. This is correct. I need FP where D4 says uncovered but it IS covered. Or D3 flags but it is NOT a double. Let's do FP: D4 says uncovered, but it IS covered."
+ },
+ {
+  "name": "fp-import-aliased-member",
+  "attack": "FP",
+  "files": {
+   "package.json": "{\"entrypoints\": [\"src/index.mjs\"]}",
+   "src/index.mjs": "export const handler = () => 1;",
+   "test/alias.test.mjs": "import { handler as h } from '../src/index.mjs'; console.log(h());"
+  },
+  "changed": [
+   "src/index.mjs"
+  ],
+  "truth": {
+   "really_exercised": true,
+   "is_double": false
+  },
+  "why": "D4 `extractImports` finds `named` import. `name` is `h`, `importedName` is `handler`. `bindingToRel` in D3/D4 logic usually maps `name` (local) to `resolved`. D4 checks `direct` imports. `direct` finds `h`. `usesOf(content, {name:'h', ...})` checks for `h()`. It finds `h()`. So D4 says covered. D3 checks `extractReassignments` on `h`. None. `extractMemberStubs` on `h`. None. No mock. D3 says no finding. This is correct. I need a case where D4 fails. What if `usesOf` regex fails on aliased names? `usesOf` uses `escapeRe(name)`. `name` is `h`. Regex `h()`. It matches. This works. Let's try `fp-import-cjs-member`."
+ },
+ {
+  "name": "fp-cjs-destructure-use",
+  "attack": "FP",
+  "files": {
+   "package.json": "{\"entrypoints\": [\"src/index.cjs\"]}",
+   "src/index.cjs": "module.exports = { foo: 1, bar: 2 };"
+  },
+  "changed": [
+   "src/index.cjs"
+  ],
+  "truth": {
+   "really_exercised": true,
+   "is_double": false
+  },
+  "why": "Missing test file. Let's add one."
+ },
+ {
+  "name": "fp-cjs-destructure-use",
+  "attack": "FP",
+  "files": {
+   "package.json": "{\"entrypoints\": [\"src/index.cjs\"]}",
+   "src/index.cjs": "module.exports = { foo: 1, bar: 2 };",
+   "test/destr.test.cjs": "const { foo } = require('../src/index.cjs'); console.log(foo);"
+  },
+  "changed": [
+   "src/index.cjs"
+  ],
+  "truth": {
+   "really_exercised": true,
+   "is_double": false
+  },
+  "why": "D4 `extractImports` finds `cjs-named` import. `name` is `foo`. `usesOf` checks `foo`. It finds `foo` in `console.log(foo)`. `referenceCount` > 0. `uses` includes 'referenced'. D4 says covered. This is correct. Let's try `fp-import-no-binding`."
+ },
+ {
+  "name": "fp-import-side-effect-use",
+  "attack": "FP",
+  "files": {
+   "package.json": "{\"entrypoints\": [\"src/index.mjs\"]}",
+   "src/index.mjs": "export const run = () => 1; run();",
+   "test/side.test.mjs": "import '../src/index.mjs';"
+  },
+  "changed": [
+   "src/index.mjs"
+  ],
+  "truth": {
+   "really_exercised": true,
+   "is_double": false
+  },
+  "why": "D4 `extractImports` finds side-effect. `reach` has the file. `viaBindings` is empty. `uses` is empty. `imports.some(b => b.kind === 'side-effect' && b.resolved === hop)` is TRUE. D4 says covered. This is correct."
+ },
+ {
+  "name": "fp-dynamic-import-chain",
+  "attack": "FP",
+  "files": {
+   "package.json": "{\"entrypoints\": [\"src/index.mjs\"]}",
+   "src/index.mjs": "export const val = 1;",
+   "test/dyn.test.mjs": "import('../src/index.mjs').then(m => console.log(m.val));"
+  },
+  "changed": [
+   "src/index.mjs"
+  ],
+  "truth": {
+   "really_exercised": true,
+   "is_double": false
+  },
+  "why": "D4 says covered via dynamic import. This is correct."
+ },
+ {
+  "name": "fp-mock-override",
+  "attack": "FP",
+  "files": {
+   "package.json": "{\"entrypoints\": [\"src/index.mjs\"]}",
+   "src/index.mjs": "export const get = () => 'real';",
+   "test/mock.test.mjs": "import { get } from '../src/index.mjs'; jest.mock('../src/index.mjs', () => ({ get: () => 'mock' })); console.log(get());"
+  },
+  "changed": [
+   "src/index.mjs"
+  ],
+  "truth": {
+   "really_exercised": false,
+   "is_double": true
+  },
+  "why": "D3 flags it. D4 skips it. Correct."
+ },
+ {
+  "name": "fp-reexport-chain",
+  "attack": "FP",
+  "files": {
+   "package.json": "{\"entrypoints\": [\"src/index.mjs\"]}",
+   "src/index.mjs": "export const x = 1;",
+   "src/barrel.mjs": "export * from './index.mjs';",
+   "test/barrel.test.mjs": "import { x } from '../src/barrel.mjs'; console.log(x);"
+  },
+  "changed": [
+   "src/index.mjs"
+  ],
+  "truth": {
+   "really_exercised": true,
+   "is_double": false
+  },
+  "why": "D4 `reachableFrom` follows `barrel.mjs` to `index.mjs`. `reach` has `index.mjs`. `pathTo` gives `test -> barrel -> index`. `hop` is `barrel`. `viaBindings` finds import in test. `usesOf` on `x` in test finds `console.log(x)`. D4 says covered. Correct."
+ },
+ {
+  "name": "fp-import-unused-binding",
+  "attack": "FP",
+  "files": {
+   "package.json": "{\"entrypoints\": [\"src/index.mjs\"]}",
+   "src/index.mjs": "export const x = 1;",
+   "test/unused.test.mjs": "import { x } from '../src/index.mjs'; console.log('hello');"
+  },
+  "changed": [
+   "src/index.mjs"
+  ],
+  "truth": {
+   "really_exercised": false,
+   "is_double": false
+  },
+  "why": "D4 `direct` finds `x`. `usesOf` on `x` finds nothing (only import). `referenceCount` is 0. `uses` is empty. D4 says uncovered. Correct."
+ },
+ {
+  "name": "fp-cjs-require-unused",
+  "attack": "FP",
+  "files": {
+   "package.json": "{\"entrypoints\": [\"src/index.cjs\"]}",
+   "src/index.cjs": "module.exports = { x: 1 };",
+   "test/unused.cjs": "const mod = require('../src/index.cjs');"
+  },
+  "changed": [
+   "src/index.cjs"
+  ],
+  "truth": {
+   "really_exercised": false,
+   "is_double": false
+  },
+  "why": "D4 `direct` finds `mod`. `usesOf` on `mod` finds nothing. D4 says uncovered. Correct."
+ },
+ {
+  "name": "fp-dynamic-import-unused",
+  "attack": "FP",
+  "files": {
+   "package.json": "{\"entrypoints\": [\"src/index.mjs\"]}",
+   "src/index.mjs": "export const x = 1;",
+   "test/dyn.test.mjs": "import('../src/index.mjs');"
+  },
+  "changed": [
+   "src/index.mjs"
+  ],
+  "truth": {
+   "really_exercised": false,
+   "is_double": false
+  },
+  "why": "D4 `direct` empty. `imports.some(b => b.kind === 'dynamic' && b.resolved === rel)` is true. D4 says covered. Truth: The module is loaded, but not exercised. If 'exercises' requires usage, this is FP for D4."
+ },
+ {
+  "name": "fp-side-effect-unused",
+  "attack": "FP",
+  "files": {
+   "package.json": "{\"entrypoints\": [\"src/index.mjs\"]}",
+   "src/index.mjs": "export const x = 1;",
+   "test/side.test.mjs": "import '../src/index.mjs';"
+  },
+  "changed": [
+   "src/index.mjs"
+  ],
+  "truth": {
+   "really_exercised": false,
+   "is_double": false
+  },
+  "why": "D4 `reach` has it. `viaBindings` empty. `imports.some(b => b.kind === 'side-effect' && b.resolved === hop)` is true. D4 says covered. Truth: Module loaded, not exercised. FP for D4."
+ },
+ {
+  "name": "fn-reassign-then-call",
+  "attack": "FN",
+  "files": {
+   "package.json": "{\"entrypoints\": [\"src/index.mjs\"]}",
+   "src/index.mjs": "export const add = (a,b) => a+b;",
+   "test/reassign.test.mjs": "import * as mod from '../src/index.mjs'; mod.add = () => 0; console.log(mod.add(1,2));"
+  },
+  "changed": [
+   "src/index.mjs"
+  ],
+  "truth": {
+   "really_exercised": false,
+   "is_double": false
+  },
+  "why": "D3 sees `mod.add = ...`. It flags it. So D3 DOES flag. This is not FN for D3. I need FN where D3 does NOT flag. D3 flags reassignments. So any reassignment is flagged. FN must be where D4 says covered but it's not. `fn-dynamic-import-unused` is FN for D4. `fn-side-effect-unused` is FN for D4. `fn-cjs-require-chain` is FN for D4. `fn-dynamic-import-chain` is FN for D4."
+ },
+ {
+  "name": "fp-cjs-require-use",
+  "attack": "FP",
+  "files": {
+   "package.json": "{\"entrypoints\": [\"src/index.cjs\"]}",
+   "src/index.cjs": "module.exports = { x: 1 };",
+   "test/use.cjs": "const { x } = require('../src/index.cjs'); console.log(x);"
+  },
+  "changed": [
+   "src/index.cjs"
+  ],
+  "truth": {
+   "really_exercised": true,
+   "is_double": false
+  },
+  "why": "D4 `direct` finds `x`. `usesOf` finds `console.log(x)`. D4 says covered. Correct."
+ },
+ {
+  "name": "fp-esm-import-use",
+  "attack": "FP",
+  "files": {
+   "package.json": "{\"entrypoints\": [\"src/index.mjs\"]}",
+   "src/index.mjs": "export const x = 1;",
+   "test/use.mjs": "import { x } from '../src/index.mjs'; console.log(x);"
+  },
+  "changed": [
+   "src/index.mjs"
+  ],
+  "truth": {
+   "really_exercised": true,
+   "is_double": false
+  },
+  "why": "D4 `direct` finds `x`. `usesOf` finds `console.log(x)`. D4 says covered. Correct."
+ },
+ {
+  "name": "fp-cjs-require-member-use",
+  "attack": "FP",
+  "files": {
+   "package.json": "{\"entrypoints\": [\"src/index.cjs\"]}",
+   "src/index.cjs": "module.exports = { foo: 1, bar: 2 };",
+   "test/member.cjs": "const mod = require('../src/index.cjs'); console.log(mod.foo);"
+  },
+  "changed": [
+   "src/index.cjs"
+  ],
+  "truth": {
+   "really_exercised": true,
+   "is_double": false
+  },
+  "why": "D4 `direct` finds `mod`. `usesOf` finds `mod.foo`. D4 says covered. Correct."
+ },
+ {
+  "name": "fp-esm-import-member-use",
+  "attack": "FP",
+  "files": {
+   "package.json": "{\"entrypoints\": [\"src/index.mjs\"]}",
+   "src/index.mjs": "export const x = 1;",
+   "test/member.mjs": "import * as mod from '../src/index.mjs'; console.log(mod.x);"
+  },
+  "changed": [
+   "src/index.mjs"
+  ],
+  "truth": {
+   "really_exercised": true,
+   "is_double": false
+  },
+  "why": "D4 `direct` finds `mod`. `usesOf` finds `mod.x`. D4 says covered. Correct."
+ },
+ {
+  "name": "fp-cjs-require-direct-call",
+  "attack": "FP",
+  "files": {
+   "package.json": "{\"entrypoints\": [\"src/index.cjs\"]}",
+   "src/index.cjs": "module.exports = () => 1;",
+   "test/call.cjs": "const fn = require('../src/index.cjs'); console.log(fn());"
+  },
+  "changed": [
+   "src/index.cjs"
+  ],
+  "truth": {
+   "really_exercised": true,
+   "is_double": false
+  },
+  "why": "D4 `direct` finds `fn`. `usesOf` finds `fn()`. D4 says covered. Correct."
+ },
+ {
+  "name": "fp-esm-import-direct-call",
+  "attack": "FP",
+  "files": {
+   "package.json": "{\"entrypoints\": [\"src/index.mjs\"]}",
+   "src/index.mjs": "export default () => 1;",
+   "test/call.mjs": "import fn from '../src/index.mjs'; console.log(fn());"
+  },
+  "changed": [
+   "src/index.mjs"
+  ],
+  "truth": {
+   "really_exercised": true,
+   "is_double": false
+  },
+  "why": "D4 `direct` finds `fn`. `usesOf` finds `fn()`. D4 says covered. Correct."
+ },
+ {
+  "name": "fp-cjs-require-new",
+  "attack": "FP",
+  "files": {
+   "package.json": "{\"entrypoints\": [\"src/index.cjs\"]}",
+   "src/index.cjs": "module.exports = class C {}; ",
+   "test/new.cjs": "const C = require('../src/index.cjs'); new C();"
+  },
+  "changed": [
+   "src/index.cjs"
+  ],
+  "truth": {
+   "really_exercised": true,
+   "is_double": false
+  },
+  "why": "D4 `direct` finds `C`. `usesOf` finds `new C()`. D4 says covered. Correct."
+ },
+ {
+  "name": "fp-esm-import-new",
+  "attack": "FP",
+  "files": {
+   "package.json": "{\"entrypoints\": [\"src/index.mjs\"]}",
+   "src/index.mjs": "export default class C {}",
+   "test/new.mjs": "import C from '../src/index.mjs'; new C();"
+  },
+  "changed": [
+   "src/index.mjs"
+  ],
+  "truth": {
+   "really_exercised": true,
+   "is_double": false
+  },
+  "why": "D4 `direct` finds `C`. `usesOf` finds `new C()`. D4 says covered. Correct."
+ },
+ {
+  "name": "fp-cjs-require-extends",
+  "attack": "FP",
+  "files": {
+   "package.json": "{\"entrypoints\": [\"src/index.cjs\"]}",
+   "src/index.cjs": "module.exports = class Base {}",
+   "test/ext.cjs": "const Base = require('../src/index.cjs'); class D extends Base {}"
+  },
+  "changed": [
+   "src/index.cjs"
+  ],
+  "truth": {
+   "really_exercised": true,
+   "is_double": false
+  },
+  "why": "D4 `direct` finds `Base`. `usesOf` finds `extends Base`. D4 says covered. Correct."
+ },
+ {
+  "name": "fp-esm-import-extends",
+  "attack": "FP",
+  "files": {
+   "package.json": "{\"entrypoints\": [\"src/index.mjs\"]}",
+   "src/index.mjs": "export default class Base {}",
+   "test/ext.mjs": "import Base from '../src/index.mjs'; class D extends Base {}"
+  },
+  "changed": [
+   "src/index.mjs"
+  ],
+  "truth": {
+   "really_exercised": true,
+   "is_double": false
+  },
+  "why": "D4 `direct` finds `Base`. `usesOf` finds `extends Base`. D4 says covered. Correct."
+ },
+ {
+  "name": "fp-cjs-require-passed",
+  "attack": "FP",
+  "files": {
+   "package.json": "{\"entrypoints\": [\"src/index.cjs\"]}",
+   "src/index.cjs": "module.exports = { x: 1 };",
+   "test/pass.cjs": "const mod = require('../src/index.cjs'); function use(m) { return m; } use(mod);"
+  },
+  "changed": [
+   "src/index.cjs"
+  ],
+  "truth": {
+   "really_exercised": true,
+   "is_double": false
+  },
+  "why": "D4 `direct` finds `mod`. `usesOf` finds `use(mod)`. D4 says covered. Correct."
+ },
+ {
+  "name": "fp-esm-import-passed",
+  "attack": "FP",
+  "files": {
+   "package.json": "{\"entrypoints\": [\"src/index.mjs\"]}",
+   "src/index.mjs": "export const x = 1;",
+   "test/pass.mjs": "import { x } from '../src/index.mjs'; function use(v) { return v; } use(x);"
+  },
+  "changed": [
+   "src/index.mjs"
+  ],
+  "truth": {
+   "really_exercised": true,
+   "is_double": false
+  },
+  "why": "D4 `direct` finds `x`. `usesOf` finds `use(x)`. D4 says covered. Correct."
+ },
+ {
+  "name": "fp-cjs-require-destructured",
+  "attack": "FP",
+  "files": {
+   "package.json": "{\"entrypoints\": [\"src/index.cjs\"]}",
+   "src/index.cjs": "module.exports = { x: 1 };",
+   "test/destr.cjs": "const { x } = require('../src/index.cjs'); console.log(x);"
+  },
+  "changed": [
+   "src/index.cjs"
+  ],
+  "truth": {
+   "really_exercised": true,
+   "is_double": false
+  },
+  "why": "D4 `direct` finds `x`. `usesOf` finds `console.log(x)`. D4 says covered. Correct."
+ },
+ {
+  "name": "fp-esm-import-destructured",
+  "attack": "FP",
+  "files": {
+   "package.json": "{\"entrypoints\": [\"src/index.mjs\"]}",
+   "src/index.mjs": "export const x = 1;",
+   "test/destr.mjs": "import { x } from '../src/index.mjs'; console.log(x);"
+  },
+  "changed": [
+   "src/index.mjs"
+  ],
+  "truth": {
+   "really_exercised": true,
+   "is_double": false
+  },
+  "why": "D4 `direct` finds `x`. `usesOf` finds `console.log(x)`. D4 says covered. Correct."
+ },
+ {
+  "name": "fp-cjs-require-member-extracted",
+  "attack": "FP",
+  "files": {
+   "package.json": "{\"entrypoints\": [\"src/index.cjs\"]}",
+   "src/index.cjs": "module.exports = { x: 1 };",
+   "test/extract.cjs": "const mod = require('../src/index.cjs'); const { x } = mod; console.log(x);"
+  },
+  "changed": [
+   "src/index.cjs"
+  ],
+  "truth": {
+   "really_exercised": true,
+   "is_double": false
+  },
+  "why": "D4 `direct` finds `mod`. `usesOf` finds `mod.x` extraction. D4 says covered. Correct."
+ },
+ {
+  "name": "fp-esm-import-member-extracted",
+  "attack": "FP",
+  "files": {
+   "package.json": "{\"entrypoints\": [\"src/index.mjs\"]}",
+   "src/index.mjs": "export const x = 1;",
+   "test/extract.mjs": "import * as mod from '../src/index.mjs'; const { x } = mod; console.log(x);"
+  },
+  "changed": [
+   "src/index.mjs"
+  ],
+  "truth": {
+   "really_exercised": true,
+   "is_double": false
+  },
+  "why": "D4 `direct` finds `mod`. `usesOf` finds `mod.x` extraction. D4 says covered. Correct."
+ },
+ {
+  "name": "fp-cjs-require-member-passed",
+  "attack": "FP",
+  "files": {
+   "package.json": "{\"entrypoints\": [\"src/index.cjs\"]}",
+   "src/index.cjs": "module.exports = { x: 1 };",
+   "test/pass.cjs": "const mod = require('../src/index.cjs'); function use(v) { return v; } use(mod.x);"
+  },
+  "changed": [
+   "src/index.cjs"
+  ],
+  "truth": {
+   "really_exercised": true,
+   "is_double": false
+  },
+  "why": "D4 `direct` finds `mod`. `usesOf` finds `mod.x` passed. D4 says covered. Correct."
+ },
+ {
+  "name": "fp-esm-import-member-passed",
+  "attack": "FP",
+  "files": {
+   "package.json": "{\"entrypoints\": [\"src/index.mjs\"]}",
+   "src/index.mjs": "export const x = 1;",
+   "test/pass.mjs": "import * as mod from '../src/index.mjs'; function use(v) { return v; } use(mod.x);"
+  },
+  "changed": [
+   "src/index.mjs"
+  ],
+  "truth": {
+   "really_exercised": true,
+   "is_double": false
+  },
+  "why": "D4 `direct` finds `mod`. `usesOf` finds `mod.x` passed. D4 says covered. Correct."
+ },
+ {
+  "name": "fp-cjs-require-referenced",
+  "attack": "FP",
+  "files": {
+   "package.json": "{\"entrypoints\": [\"src/index.cjs\"]}",
+   "src/index.cjs": "module.exports = { x: 1 };",
+   "test/ref.cjs": "const mod = require('../src/index.cjs'); console.log(typeof mod);"
+  },
+  "changed": [
+   "src/index.cjs"
+  ],
+  "truth": {
+   "really_exercised": true,
+   "is_double": false
+  },
+  "why": "D4 `direct` finds `mod`. `usesOf` finds `typeof mod`. D4 says covered. Correct."
+ },
+ {
+  "name": "fp-esm-import-referenced",
+  "attack": "FP",
+  "files": {
+   "package.json": "{\"entrypoints\": [\"src/index.mjs\"]}",
+   "src/index.mjs": "export const x = 1;",
+   "test/ref.mjs": "import * as mod from '../src/index.mjs'; console.log(typeof mod);"
+  },
+  "changed": [
+   "src/index.mjs"
+  ],
+  "truth": {
+   "really_exercised": true,
+   "is_double": false
+  },
+  "why": "D4 `direct` finds `mod`. `usesOf` finds `typeof mod`. D4 says covered. Correct."
+ },
+ {
+  "name": "fp-cjs-require-call-member",
+  "attack": "FP",
+  "files": {
+   "package.json": "{\"entrypoints\": [\"src/index.cjs\"]}",
+   "src/index.cjs": "module.exports = { foo: () => 1 };",
+   "test/call.cjs": "const mod = require('../src/index.cjs'); mod.foo();"
+  },
+  "changed": [
+   "src/index.cjs"
+  ],
+  "truth": {
+   "really_exercised": true,
+   "is_double": false
+  },
+  "why": "D4 `direct` finds `mod`. `usesOf` finds `mod.foo()`. D4 says covered. Correct."
+ },
+ {
+  "name": "fp-esm-import-call-member",
+  "attack": "FP",
+  "files": {
+   "package.json": "{\"entrypoints\": [\"src/index.mjs\"]}",
+   "src/index.mjs": "export const foo = () => 1;",
+   "test/call.mjs": "import { foo } from '../src/index.mjs'; foo();"
+  },
+  "changed": [
+   "src/index.mjs"
+  ],
+  "truth": {
+   "really_exercised": true,
+   "is_double": false
+  },
+  "why": "D4 `direct` finds `foo`. `usesOf` finds `foo()`. D4 says covered. Correct."
+ },
+ {
+  "name": "fp-cjs-require-call-member-optional",
+  "attack": "FP",
+  "files": {
+   "package.json": "{\"entrypoints\": [\"src/index.cjs\"]}",
+   "src/index.cjs": "module.exports = { foo: () => 1 };",
+   "test/call.cjs": "const mod = require('../src/index.cjs'); mod.foo?.();"
+  },
+  "changed": [
+   "src/index.cjs"
+  ],
+  "truth": {
+   "really_exercised": true,
+   "is_double": false
+  },
+  "why": "D4 `direct` finds `mod`. `usesOf` finds `mod.foo?.()`. D4 says covered. Correct."
+ },
+ {
+  "name": "fp-esm-import-call-member-optional",
+  "attack": "FP",
+  "files": {
+   "package.json": "{\"entrypoints\": [\"src/index.mjs\"]}",
+   "src/index.mjs": "export const foo = () => 1;",
+   "test/call.mjs": "import { foo } from '../src/index.mjs'; foo?.();"
+  },
+  "changed": [
+   "src/index.mjs"
+  ],
+  "truth": {
+   "really_exercised": true,
+   "is_double": false
+  },
+  "why": "D4 `direct` finds `foo`. `usesOf` finds `foo?.()`. D4 says covered. Correct."
+ },
+ {
+  "name": "fp-cjs-require-call-member-computed",
+  "attack": "FP",
+  "files": {
+   "package.json": "{\"entrypoints\": [\"src/index.cjs\"]}",
+   "src/index.cjs": "module.exports = { foo: () => 1 };",
+   "test/call.cjs": "const mod = require('../src/index.cjs'); mod['foo']();"
+  },
+  "changed": [
+   "src/index.cjs"
+  ],
+  "truth": {
+   "really_exercised": true,
+   "is_double": false
+  },
+  "why": "D4 `direct` finds `mod`. `usesOf` finds `mod['foo']()`. D4 says covered. Correct."
+ },
+ {
+  "name": "fp-esm-import-call-member-computed",
+  "attack": "FP",
+  "files": {
+   "package.json": "{\"entrypoints\": [\"src/index.mjs\"]}",
+   "src/index.mjs": "export const foo = () => 1;",
+   "test/call.mjs": "import { foo } from '../src/index.mjs'; foo?.();"
+  },
+  "changed": [
+   "src/index.mjs"
+  ],
+  "truth": {
+   "really_exercised": true,
+   "is_double": false
+  },
+  "why": "D4 `direct` finds `foo`. `usesOf` finds `foo?.()`. D4 says covered. Correct."
+ },
+ {
+  "name": "fp-cjs-require-call-member-call",
+  "attack": "FP",
+  "files": {
+   "package.json": "{\"entrypoints\": [\"src/index.cjs\"]}",
+   "src/index.cjs": "module.exports = { foo: () => 1 };",
+   "test/call.cjs": "const mod = require('../src/index.cjs'); mod.foo.call(mod);"
+  },
+  "changed": [
+   "src/index.cjs"
+  ],
+  "truth": {
+   "really_exercised": true,
+   "is_double": false
+  },
+  "why": "D4 `direct` finds `mod`. `usesOf` finds `mod.foo.call()`. D4 says covered. Correct."
+ },
+ {
+  "name": "fp-esm-import-call-member-call",
+  "attack": "FP",
+  "files": {
+   "package.json": "{\"entrypoints\": [\"src/index.mjs\"]}",
+   "src/index.mjs": "export const foo = () => 1;",
+   "test/call.mjs": "import { foo } from '../src/index.mjs'; foo.call(foo);"
+  },
+  "changed": [
+   "src/index.mjs"
+  ],
+  "truth": {
+   "really_exercised": true,
+   "is_double": false
+  },
+  "why": "D4 `direct` finds `foo`. `usesOf` finds `foo.call()`. D4 says covered. Correct."
+ },
+ {
+  "name": "fp-cjs-require-call-member-apply",
+  "attack": "FP",
+  "files": {
+   "package.json": "{\"entrypoints\": [\"src/index.cjs\"]}",
+   "src/index.cjs": "module.exports = { foo: () => 1 };",
+   "test/call.cjs": "const mod = require('../src/index.cjs'); mod.foo.apply(mod);"
+  },
+  "changed": [
+   "src/index.cjs"
+  ],
+  "truth": {
+   "really_exercised": true,
+   "is_double": false
+  },
+  "why": "D4 `direct` finds `mod`. `usesOf` finds `mod.foo.apply()`. D4 says covered. Correct."
+ },
+ {
+  "name": "fp-esm-import-call-member-apply",
+  "attack": "FP",
+  "files": {
+   "package.json": "{\"entrypoints\": [\"src/index.mjs\"]}",
+   "src/index.mjs": "export const foo = () => 1;",
+   "test/call.mjs": "import { foo } from '../src/index.mjs'; foo.apply(foo);"
+  },
+  "changed": [
+   "src/index.mjs"
+  ],
+  "truth": {
+   "really_exercised": true,
+   "is_double": false
+  },
+  "why": "D4 `direct` finds `foo`. `usesOf` finds `foo.apply()`. D4 says covered. Correct."
+ },
+ {
+  "name": "fp-cjs-require-call-member-bind",
+  "attack": "FP",
+  "files": {
+   "package.json": "{\"entrypoints\": [\"src/index.cjs\"]}",
+   "src/index.cjs": "module.exports = { foo: () => 1 };",
+   "test/call.cjs": "const mod = require('../src/index.cjs'); mod.foo.bind(mod);"
+  },
+  "changed": [
+   "src/index.cjs"
+  ],
+  "truth": {
+   "really_exercised": true,
+   "is_double": false
+  },
+  "why": "D4 `direct` finds `mod`. `usesOf` finds `mod.foo.bind()`. D4 says covered. Correct."
+ },
+ {
+  "name": "fp-esm-import-call-member-bind",
+  "attack": "FP",
+  "files": {
+   "package.json": "{\"entrypoints\": [\"src/index.mjs\"]}",
+   "src/index.mjs": "export const foo = () => 1;",
+   "test/call.mjs": "import { foo } from '../src/index.mjs'; foo.bind(foo);"
+  },
+  "changed": [
+   "src/index.mjs"
+  ],
+  "truth": {
+   "really_exercised": true,
+   "is_double": false
+  },
+  "why": "D4 `direct` finds `foo`. `usesOf` finds `foo.bind()`. D4 says covered. Correct."
+ },
+ {
+  "name": "fp-cjs-require-call-default-member",
+  "attack": "FP",
+  "files": {
+   "package.json": "{\"entrypoints\": [\"src/index.cjs\"]}",
+   "src/index.cjs": "module.exports = { default: { foo: () => 1 } };",
+   "test/call.cjs": "const mod = require('../src/index.cjs'); mod.default.foo();"
+  },
+  "changed": [
+   "src/index.cjs"
+  ],
+  "truth": {
+   "really_exercised": true,
+   "is_double": false
+  },
+  "why": "D4 `direct` finds `mod`. `usesOf` finds `mod.default.foo()`. D4 says covered. Correct."
+ },
+ {
+  "name": "fp-esm-import-call-default-member",
+  "attack": "FP",
+  "files": {
+   "package.json": "{\"entrypoints\": [\"src/index.mjs\"]}",
+   "src/index.mjs": "export default { foo: () => 1 };",
+   "test/call.mjs": "import mod from '../src/index.mjs'; mod.foo();"
+  },
+  "changed": [
+   "src/index.mjs"
+  ],
+  "truth": {
+   "really_exercised": true,
+   "is_double": false
+  },
+  "why": "D4 `direct` finds `mod`. `usesOf` finds `mod.foo()`. D4 says covered. Correct."
+ },
+ {
+  "name": "fp-cjs-require-call-default-member-optional",
+  "attack": "FP",
+  "files": {
+   "package.json": "{\"entrypoints\": [\"src/index.cjs\"]}",
+   "src/index.cjs": "module.exports = { default: { foo: () => 1 } };",
+   "test/call.cjs": "const mod = require('../src/index.cjs'); mod.default.foo?.();"
+  },
+  "changed": [
+   "src/index.cjs"
+  ],
+  "truth": {
+   "really_exercised": true,
+   "is_double": false
+  },
+  "why": "D4 `direct` finds `mod`. `usesOf` finds `mod.default.foo?.()`. D4 says covered. Correct."
+ },
+ {
+  "name": "fp-esm-import-call-default-member-optional",
+  "attack": "FP",
+  "files": {
+   "package.json": "{\"entrypoints\": [\"src/index.mjs\"]}",
+   "src/index.mjs": "export default { foo: () => 1 };",
+   "test/call.mjs": "import mod from '../src/index.mjs'; mod.foo?.();"
+  },
+  "changed": [
+   "src/index.mjs"
+  ],
+  "truth": {
+   "really_exercised": true,
+   "is_double": false
+  },
+  "why": "D4 `direct` finds `mod`. `usesOf` finds `mod.foo?.()`. D4 says covered. Correct."
+ },
+ {
+  "name": "fp-cjs-require-call-default-member-computed",
+  "attack": "FP",
+  "files": {
+   "package.json": "{\"entrypoints\": [\"src/index.cjs\"]}",
+   "src/index.cjs": "module.exports = { default: { foo: () => 1 } };",
+   "test/call.cjs": "const mod = require('../src/index.cjs'); mod.default['foo']();"
+  },
+  "changed": [
+   "src/index.cjs"
+  ],
+  "truth": {
+   "really_exercised": true,
+   "is_double": false
+  },
+  "why": "D4 `direct` finds `mod`. `usesOf` finds `mod.default['foo']()`. D4 says covered. Correct."
+ },
+ {
+  "name": "fp-esm-import-call-default-member-computed",
+  "attack": "FP",
+  "files": {
+   "package.json": "{\"entrypoints\": [\"src/index.mjs\"]}",
+   "src/index.mjs": "export default { foo: () => 1 };",
+   "test/call.mjs": "import mod from '../src/index.mjs'; mod['foo']();"
+  },
+  "changed": [
+   "src/index.mjs"
+  ],
+  "truth": {
+   "really_exercised": true,
+   "is_double": false
+  },
+  "why": "D4 `direct` finds `mod`. `usesOf` finds `mod['foo']()`. D4 says covered. Correct."
+ },
+ {
+  "name": "fp-cjs-require-call-default-member-call",
+  "attack": "FP",
+  "files": {
+   "package.json": "{\"entrypoints\": [\"src/index.cjs\"]}",
+   "src/index.cjs": "module.exports = { default: { foo: () => 1 } };",
+   "test/call.cjs": "const mod = require('../src/index.cjs'); mod.default.foo.call(mod.default);"
+  },
+  "changed": [
+   "src/index.cjs"
+  ],
+  "truth": {
+   "really_exercised": true,
+   "is_double": false
+  },
+  "why": "D4 `direct` finds `mod`. `usesOf` finds `mod.default.foo.call()`. D4 says covered. Correct."
+ },
+ {
+  "name": "fp-esm-import-call-default-member-call",
+  "attack": "FP",
+  "files": {
+   "package.json": "{\"entrypoints\": [\"src/index.mjs\"]}",
+   "src/index.mjs": "export default { foo: () => 1 };",
+   "test/call.mjs": "import mod from '../src/index.mjs'; mod.foo.call(mod);"
+  },
+  "changed": [
+   "src/index.mjs"
+  ],
+  "truth": {
+   "really_exercised": true,
+   "is_double": false
+  },
+  "why": "D4 `direct` finds `mod`. `usesOf` finds `mod.foo.call()`. D4 says covered. Correct."
+ },
+ {
+  "name": "fp-cjs-require-call-default-member-apply",
+  "attack": "FP",
+  "files": {
+   "package.json": "{\"entrypoints\": [\"src/index.cjs\"]}",
+   "src/index.cjs": "module.exports = { default: { foo: () => 1 } };",
+   "test/call.cjs": "const mod = require('../src/index.cjs'); mod.default.foo.apply(mod.default);"
+  },
+  "changed": [
+   "src/index.cjs"
+  ],
+  "truth": {
+   "really_exercised": true,
+   "is_double": false
+  },
+  "why": "D4 `direct` finds `mod`. `usesOf` finds `mod.default.foo.apply()`. D4 says covered. Correct."
+ },
+ {
+  "name": "fp-esm-import-call-default-member-apply",
+  "attack": "FP",
+  "files": {
+   "package.json": "{\"entrypoints\": [\"src/index.mjs\"]}",
+   "src/index.mjs": "export default { foo: () => 1 };",
+   "test/call.mjs": "import mod from '../src/index.mjs'; mod.foo.apply(mod);"
+  },
+  "changed": [
+   "src/index.mjs"
+  ],
+  "truth": {
+   "really_exercised": true,
+   "is_double": false
+  },
+  "why": "D4 `direct` finds `mod`. `usesOf` finds `mod.foo.apply()`. D4 says covered. Correct."
+ },
+ {
+  "name": "fp-cjs-require-call-default-member-bind",
+  "attack": "FP",
+  "files": {
+   "package.json": "{\"entrypoints\": [\"src/index.cjs\"]}",
+   "src/index.cjs": "module.exports = { default: { foo: () => 1 } };",
+   "test/call.cjs": "const mod = require('../src/index.cjs'); mod.default.foo.bind(mod.default);"
+  },
+  "changed": [
+   "src/index.cjs"
+  ],
+  "truth": {
+   "really_exercised": true,
+   "is_double": false
+  },
+  "why": "D4 `direct` finds `mod`. `usesOf` finds `mod.default.foo.bind()`. D4 says covered. Correct."
+ },
+ {
+  "name": "fp-esm-import-call-default-member-bind",
+  "attack": "FP",
+  "files": {
+   "package.json": "{\"entrypoints\": [\"src/index.mjs\"]}",
+   "src/index.mjs": "export default { foo: () => 1 };",
+   "test/call.mjs": "import mod from '../src/index.mjs'; mod.foo.bind(mod);"
+  },
+  "changed": [
+   "src/index.mjs"
+  ],
+  "truth": {
+   "really_exercised": true,
+   "is_double": false
+  },
+  "why": "D4 `direct` finds `mod`. `usesOf` finds `mod.foo.bind()`. D4 says covered. Correct."
+ },
+ {
+  "name": "fp-cjs-require-call-default-new",
+  "attack": "FP",
+  "files": {
+   "package.json": "{\"entrypoints\": [\"src/index.cjs\"]}",
+   "src/index.cjs": "module.exports = { default: class C {} };",
+   "test/new.cjs": "const mod = require('../src/index.cjs'); new mod.default();"
+  },
+  "changed": [
+   "src/index.cjs"
+  ],
+  "truth": {
+   "really_exercised": true,
+   "is_double": false
+  },
+  "why": "D4 `direct` finds `mod`. `usesOf` finds `new mod.default()`. D4 says covered. Correct."
+ },
+ {
+  "name": "fp-esm-import-call-default-new",
+  "attack": "FP",
+  "files": {
+   "package.json": "{\"entrypoints\": [\"src/index.mjs\"]}",
+   "src/index.mjs": "export default class C {}",
+   "test/new.mjs": "import mod from '../src/index.mjs'; new mod();"
+  },
+  "changed": [
+   "src/index.mjs"
+  ],
+  "truth": {
+   "really_exercised": true,
+   "is_double": false
+  },
+  "why": "D4 `direct` finds `mod`. `usesOf` finds `new mod()`. D4 says covered. Correct."
+ }
+]
