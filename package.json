@@ -1,0 +1,12 @@
+{
+  "name": "sophia-merge-gate",
+  "version": "1.0.0",
+  "description": "Merge gate checkers for code quality validation",
+  "main": "merge-gate.js",
+  "scripts": {
+    "test": "node merge-gate.js"
+  },
+  "keywords": ["merge-gate", "code-quality"],
+  "author": "",
+  "license": "MIT"
+}
