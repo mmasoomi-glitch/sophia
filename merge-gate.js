@@ -92,7 +92,7 @@ function loadChangedFiles(args, projectDir) {
 
 function loadChecker(name, projectDir) {
   try {
-    const checkerPath = path.join(projectDir, '..', `${name}-checker.js`);
+    const checkerPath = path.join(projectDir, 'tools', 'merge-gate', `${name.toLowerCase()}-checker.js`);
     const checkerModule = require(checkerPath);
 
     if (name === 'D1') return checkerModule.checkReachability;
