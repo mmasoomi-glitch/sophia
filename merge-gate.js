@@ -97,8 +97,8 @@ function loadChecker(name, projectDir) {
 
     if (name === 'D1') return checkerModule.checkReachability;
     if (name === 'D2') return checkerModule.checkConformance;
-    if (name === 'D3') return checkerModule.checkSelfMock;
-    if (name === 'D4') return checkerModule.checkRealDependency;
+    if (name === 'D3') return checkerModule.checkSelfMocking;
+    if (name === 'D4') return checkerModule.checkRealDependencyCoverage;
   } catch (e) {
     // Checker not found or error loading
   }
