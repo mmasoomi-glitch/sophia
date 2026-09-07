@@ -8,7 +8,8 @@
     "tools/merge-gate/selftest.js",
     "tools/merge-gate/adversary/claude-corpus.js",
     "tools/merge-gate/adversary/pod-corpus.js",
-    "tools/merge-gate/adversary/shapes.js"
+    "tools/merge-gate/adversary/shapes.js",
+    "gate-check.mjs"
   ],
   "_note": "This repository's product code is Python; the only JS here is the gate itself. merge-gate.js loads the checkers by a computed path and selftest.js spawns the adversary scripts by path, which D1 cannot follow, so they are listed as roots explicitly."
 }
